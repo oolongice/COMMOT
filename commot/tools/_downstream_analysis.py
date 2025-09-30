@@ -95,21 +95,28 @@ def communication_deg_detection(
         Trajectory-based differential expression analysis for single-cell sequencing data. Nature communications, 11(1), 1-13.
 
     """
-    # setup R environment
-    # !!! anndata2ri works only with 3.6.3 on the tested machine
-    import rpy2
-    import anndata2ri
-    import rpy2.robjects as ro
-    from rpy2.robjects.conversion import localconverter
-    import rpy2.rinterface_lib.callbacks
+    # setup R environment (tested with R >= 4.5.1, rpy2 >= 3.5, anndata2ri >= 1.2)
+    try:
+        import rpy2
+        import anndata2ri
+        import rpy2.robjects as ro
+        from rpy2.robjects.conversion import localconverter
+        from rpy2.robjects.packages import importr
+        from rpy2.robjects import numpy2ri, pandas2ri
+        import rpy2.rinterface_lib.callbacks
+    except ImportError as exc:
+        raise ImportError(
+            "communication_deg_detection requires rpy2, anndata2ri, and their dependencies."
+        ) from exc
     import logging
+
     rpy2.rinterface_lib.callbacks.logger.setLevel(logging.ERROR)
 
-    ro.r('library(tradeSeq)')
-    ro.r('library(clusterExperiment)')
+    importr('tradeSeq')
+    importr('clusterExperiment')
     anndata2ri.activate()
-    ro.numpy2ri.activate()
-    ro.pandas2ri.activate()
+    numpy2ri.activate()
+    pandas2ri.activate()
 
     # prepare input adata for R
     adata_deg = anndata.AnnData(
@@ -176,8 +183,8 @@ def communication_deg_detection(
     df_yhat = yhat_scaled
 
     anndata2ri.deactivate()
-    ro.numpy2ri.deactivate()
-    ro.pandas2ri.deactivate()
+    numpy2ri.deactivate()
+    pandas2ri.deactivate()
 
     return df_deg, df_yhat
     
@@ -866,5 +873,3 @@ def communication_spatial_autocorrelation(
     p_value = np.array(p_value, float)
 
     return moranI, p_value
-
-
