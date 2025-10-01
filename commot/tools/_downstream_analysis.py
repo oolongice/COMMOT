@@ -95,28 +95,21 @@ def communication_deg_detection(
         Trajectory-based differential expression analysis for single-cell sequencing data. Nature communications, 11(1), 1-13.
 
     """
-    # setup R environment (tested with R >= 4.5.1, rpy2 >= 3.5, anndata2ri >= 1.2)
-    try:
-        import rpy2
-        import anndata2ri
-        import rpy2.robjects as ro
-        from rpy2.robjects.conversion import localconverter
-        from rpy2.robjects.packages import importr
-        from rpy2.robjects import numpy2ri, pandas2ri
-        import rpy2.rinterface_lib.callbacks
-    except ImportError as exc:
-        raise ImportError(
-            "communication_deg_detection requires rpy2, anndata2ri, and their dependencies."
-        ) from exc
+    # setup R environment
+    # !!! anndata2ri works only with 3.6.3 on the tested machine
+    import rpy2
+    import anndata2ri
+    import rpy2.robjects as ro
+    from rpy2.robjects.conversion import localconverter
+    import rpy2.rinterface_lib.callbacks
     import logging
-
     rpy2.rinterface_lib.callbacks.logger.setLevel(logging.ERROR)
 
-    importr('tradeSeq')
-    importr('clusterExperiment')
+    ro.r('library(tradeSeq)')
+    ro.r('library(clusterExperiment)')
     anndata2ri.activate()
-    numpy2ri.activate()
-    pandas2ri.activate()
+    ro.numpy2ri.activate()
+    ro.pandas2ri.activate()
 
     # prepare input adata for R
     adata_deg = anndata.AnnData(
@@ -157,7 +150,7 @@ def communication_deg_detection(
     ro.r.assign("cellWeight", cell_weight)
 
     # perform analysis (tradeSeq-1.0.1 in R-3.6.3)
-    string_fitGAM = 'sce <- fitGAM(counts=X, pseudotime=pseudoTime[,1], cellWeights=cellWeight[,1], nknots=%d, verbose=TRUE)' % nknots
+    string_fitGAM = 'sce <- fitGAM(counts=X, pseudotime=pseudoTime[,1], cellWeights=cellWeight[,1], nknots=%d, verbose=TRUE); NULL' % nknots
     ro.r(string_fitGAM)
     ro.r('assoRes <- data.frame( associationTest(sce, global=FALSE, lineage=TRUE) )')
     ro.r('assoRes[is.nan(assoRes[,"waldStat_1"]),"waldStat_1"] <- 0.0')
@@ -169,13 +162,20 @@ def communication_deg_detection(
     ro.r('oAsso <- order(assoRes[,"waldStat_1"], decreasing=TRUE)')
     if n_deg_genes is None:
         n_deg_genes = df_assoRes.shape[0]
-    string_cluster = 'clusPat <- clusterExpressionPatterns(sce, nPoints = %d,' % n_points\
-        + 'verbose=TRUE, genes = rownames(assoRes)[oAsso][1:min(%d,length(oAsso))],' % n_deg_genes \
-        + ' k0s=4:5, alphas=c(0.1))'
-    ro.r(string_cluster)
-    ro.r('yhatScaled <- data.frame(clusPat$yhatScaled)')
-    with localconverter(ro.pandas2ri.converter):
-        yhat_scaled = ro.r['yhatScaled']
+    ro.r('genes_use <- rownames(assoRes)[oAsso]')
+    ro.r('genes_use <- genes_use[genes_use %in% rownames(sce)]')
+    ro.r('if (length(genes_use) > 0) { genes_use <- genes_use[seq_len(min(%d, length(genes_use)))] } else { genes_use <- character(0) }' % n_deg_genes)
+    n_genes_selected = int(ro.r('length(genes_use)')[0])
+    if n_genes_selected > 0:
+        string_cluster = 'clusPat <- clusterExpressionPatterns(sce, nPoints = %d, ' % n_points\
+            + 'verbose=TRUE, genes = genes_use, ' \
+            + 'k0s=4:5, alphas=c(0.1)); NULL'
+        ro.r(string_cluster)
+        ro.r('yhatScaled <- data.frame(clusPat$yhatScaled)')
+        with localconverter(ro.pandas2ri.converter):
+            yhat_scaled = ro.r['yhatScaled']
+    else:
+        yhat_scaled = pd.DataFrame()
 
     df_deg = df_assoRes.rename(columns={'waldStat_1':'waldStat', 'df_1':'df', 'pvalue_1':'pvalue'})
     idx = np.argsort(-df_deg['waldStat'].values)
@@ -183,8 +183,8 @@ def communication_deg_detection(
     df_yhat = yhat_scaled
 
     anndata2ri.deactivate()
-    numpy2ri.deactivate()
-    pandas2ri.deactivate()
+    ro.numpy2ri.deactivate()
+    ro.pandas2ri.deactivate()
 
     return df_deg, df_yhat
     
