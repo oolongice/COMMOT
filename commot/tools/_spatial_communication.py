@@ -1,11 +1,11 @@
-from typing import Optional
-import gc
+from typing import Optional, Union
 import ot
 import sys
 import anndata
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import networkx as nx
 from matplotlib import cm
 import matplotlib.pyplot as plt
 import plotly
@@ -13,995 +13,863 @@ from scipy import sparse
 from scipy.spatial import distance_matrix
 from scipy.stats import spearmanr, pearsonr
 from sklearn.preprocessing import normalize
+from sklearn.neighbors import kneighbors_graph
+from sklearn.decomposition import PCA
+import karateclub
 
-from .._optimal_transport import cot_sparse
-from .._optimal_transport import cot_combine_sparse
-from .._optimal_transport import uot
-from .._optimal_transport import usot
+from .._utils import partial_corr
+from .._utils import semipartial_corr
+from .._utils import treebased_score
+from .._utils import treebased_score_multifeature
+from .._utils import d_graph_local_jaccard
+from .._utils import d_graph_local_jaccard_weighted
+from .._utils import d_graph_global_structure
+from .._utils import leiden_clustering
+from .._utils import moranI_vector_global
+from .._utils import preprocess_vector_field
+from .._utils import binarize_sparse_matrix
 
-def kernel_function(x, eta, nu, kernel, normalization=None):
-    if kernel == "exp":
-        phi = np.exp(-np.power(x/eta, nu))
-    elif kernel == "lorentz":
-        phi = 1 / ( 1 + np.power(x/eta, nu) )
-    if normalization == "unit_row_sum":
-        phi = (phi.T / np.sum(phi.T, axis=0)).T
-    elif normalization == "unit_col_sum":
-        phi = phi / np.sum(phi, axis=0)
-    return phi
-
-def coo_from_dense_submat(row, col, x, shape):
-    col_ind, row_ind = np.meshgrid(col, row)
-    sparse_mat = sparse.coo_matrix((x.reshape(-1), (row_ind.reshape(-1), col_ind.reshape(-1))), shape=shape)
-    sparse_mat.eliminate_zeros()
-    return(sparse_mat)
-
-class CellCommunication(object):
-
-    def __init__(self,
-        adata,
-        df_ligrec,
-        dmat,
-        dis_thr,
-        cost_scale,
-        cost_type,
-        heteromeric = None,
-        heteromeric_rule = 'min',
-        heteromeric_delimiter = '_'
-    ):
-        data_genes = set(adata.var_names)
-        if not heteromeric:
-            self.ligs = list(set(df_ligrec.iloc[:,0]).intersection(data_genes))
-            self.recs = list(set(df_ligrec.iloc[:,1]).intersection(data_genes))
-            A = np.inf * np.ones([len(self.ligs), len(self.recs)], float)
-            for i in range(len(df_ligrec)):
-                tmp_lig = df_ligrec.iloc[i][0]
-                tmp_rec = df_ligrec.iloc[i][1]
-                if tmp_lig in self.ligs and tmp_rec in self.recs:
-                    if cost_scale is None:
-                        A[self.ligs.index(tmp_lig), self.recs.index(tmp_rec)] = 1.0
-                    else:
-                        A[self.ligs.index(tmp_lig), self.recs.index(tmp_rec)] = cost_scale[(tmp_lig, tmp_rec)]
-            self.A = A
-            self.S = adata[:,self.ligs].X.toarray()
-            self.D = adata[:,self.recs].X.toarray()
-
-        elif heteromeric:
-            tmp_ligs = list(set(df_ligrec.iloc[:,0]))
-            tmp_recs = list(set(df_ligrec.iloc[:,1]))
-            avail_ligs = []
-            avail_recs = []
-            for tmp_lig in tmp_ligs:
-                lig_genes = set(tmp_lig.split(heteromeric_delimiter))
-                if lig_genes.issubset(data_genes):
-                    avail_ligs.append(tmp_lig)
-            for tmp_rec in tmp_recs:
-                rec_genes = set(tmp_rec.split(heteromeric_delimiter))
-                if rec_genes.issubset(data_genes):
-                    avail_recs.append(tmp_rec)
-            self.ligs = avail_ligs
-            self.recs = avail_recs
-            A = np.inf * np.ones([len(self.ligs), len(self.recs)], float)
-            for i in range(len(df_ligrec)):
-                tmp_lig = df_ligrec.iloc[i,0]
-                tmp_rec = df_ligrec.iloc[i,1]
-                if tmp_lig in self.ligs and tmp_rec in self.recs:
-                    if cost_scale is None:
-                        A[self.ligs.index(tmp_lig), self.recs.index(tmp_rec)] = 1.0
-                    else:
-                        A[self.ligs.index(tmp_lig), self.recs.index(tmp_rec)] = cost_scale[(tmp_lig, tmp_rec)]
-            self.A = A
-            ncell = adata.shape[0]
-            S = np.zeros([ncell, A.shape[0]], float)
-            D = np.zeros([ncell, A.shape[1]], float)
-            for i in range(len(self.ligs)):
-                tmp_lig = self.ligs[i]
-                lig_genes = tmp_lig.split(heteromeric_delimiter)
-                if heteromeric_rule == 'min':
-                    S[:,i] = adata[:, lig_genes].X.toarray().min(axis=1)[:]
-                elif heteromeric_rule == 'ave':
-                    S[:,i] = adata[:, lig_genes].X.toarray().mean(axis=1)[:]
-            for i in range(len(self.recs)):
-                tmp_rec = self.recs[i]
-                rec_genes = tmp_rec.split(heteromeric_delimiter)
-                if heteromeric_rule == 'min':
-                    D[:,i] = adata[:, rec_genes].X.toarray().min(axis=1)[:]
-                elif heteromeric_rule == 'ave':
-                    D[:,i] = adata[:, rec_genes].X.toarray().mean(axis=1)[:]
-            self.S = S
-            self.D = D
-        
-        if cost_type == 'euc':
-            self.M = dmat
-        elif cost_type == 'euc_square':
-            self.M = dmat ** 2
-        if np.isscalar(dis_thr):
-            if cost_type == 'euc_square':
-                dis_thr = dis_thr ** 2
-            self.cutoff = float(dis_thr) * np.ones_like(A)
-        elif type(dis_thr) is dict:
-            self.cutoff = np.zeros_like(A)
-            for i in range(A.shape[0]):
-                for j in range(A.shape[1]):
-                    if A[i,j] > 0:
-                        if cost_type == 'euc_square':
-                            self.cutoff[i,j] = dis_thr[(self.ligs[i], self.recs[j])] ** 2
-                        else:
-                            self.cutoff[i,j] = dis_thr[(self.ligs[i], self.recs[j])]
-        self.nlig = self.S.shape[1]; self.nrec = self.D.shape[1]
-        self.npts = adata.shape[0]
-
-    def run_cot_signaling(self,
-        cot_eps_p=1e-1, 
-        cot_eps_mu=None, 
-        cot_eps_nu=None, 
-        cot_rho=1e1, 
-        cot_nitermax=1e4, 
-        cot_weights=(0.25,0.25,0.25,0.25), 
-        smooth=False, 
-        smth_eta=None, 
-        smth_nu=None, 
-        smth_kernel=None
-    ):
-        if not smooth:
-            self.comm_network = cot_combine_sparse(self.S, self.D, self.A, self.M, self.cutoff, \
-                eps_p=cot_eps_p, eps_mu=cot_eps_mu, eps_nu=cot_eps_nu, rho=cot_rho, weights=cot_weights, nitermax=cot_nitermax)
-        if smooth:
-            # Smooth the expression
-            S_smth = np.zeros_like(self.S)
-            D_smth = np.zeros_like(self.D)
-            for i in range(self.nlig):
-                nzind = np.where(self.S[:,i] > 0)[0]
-                phi = kernel_function(self.M[nzind,:][:,nzind], smth_eta, smth_nu, smth_kernel, normalization='unit_col_sum')
-                S_smth[nzind,i] = np.matmul( phi, self.S[nzind,i].reshape(-1,1) )[:,0]
-            for i in range(self.nrec):
-                nzind = np.where(self.D[:,i] > 0)[0]
-                phi = kernel_function(self.M[nzind,:][:,nzind], smth_eta, smth_nu, smth_kernel, normalization='unit_col_sum')
-                D_smth[nzind,i] = np.matmul( phi, self.D[nzind,i].reshape(-1,1) )[:,0]
-            # Get the transport plans for the smoothed distributions
-            P_smth = cot_combine_sparse(S_smth, D_smth, self.A, self.M, self.cutoff, \
-                eps_p=cot_eps_p, eps_mu=cot_eps_mu, eps_nu=cot_eps_nu, rho=cot_rho, weights=cot_weights, nitermax=cot_nitermax)
-            # Deconvolute back to original cells
-            self.comm_network = {}
-            for i in range(self.nlig):
-                S = self.S[:,i]
-                nzind_S = np.where(S > 0)[0]
-                phi_S = kernel_function(self.M[nzind_S,:][:,nzind_S], smth_eta, smth_nu, smth_kernel, normalization='unit_col_sum')
-                S_contrib = phi_S * S[nzind_S]; S_contrib = S_contrib / np.sum(S_contrib, axis=1, keepdims=True)
-                for j in range(self.nrec):
-                    D = self.D[:,j]
-                    nzind_D = np.where(D > 0)[0]
-                    if np.isinf(self.A[i,j]): continue
-                    P_dense = P_smth[(i,j)].toarray()
-                    P_sub = P_dense[nzind_S,:][:,nzind_D]
-                    phi_D = kernel_function(self.M[nzind_D,:][:,nzind_D], smth_eta, smth_nu, smth_kernel, normalization='unit_col_sum')
-                    D_contrib = phi_D * D[nzind_D]; D_contrib = D_contrib / np.sum(D_contrib, axis=1, keepdims=True)
-                    P_deconv = np.matmul(S_contrib.T, np.matmul(P_sub, D_contrib))
-                    for k in range(len(nzind_D)):
-                        P_dense[nzind_S, nzind_D[k]] = P_deconv[:,k]
-                    P_deconv_sparse = coo_from_dense_submat(nzind_S, nzind_D, P_deconv, shape=(self.npts, self.npts))
-                    self.comm_network[(i,j)] = P_deconv_sparse
-
-    def smooth(self, eta, nu, kernel):
-        S_smth = np.zeros_like(self.S)
-        D_smth = np.zeros_like(self.D)
-        for i in range(self.nlig):
-            nzind = np.where(self.S[:,i] > 0)[0]
-            phi = kernel_function(self.M[nzind,:][:,nzind], eta, nu, kernel, normalization='unit_col_sum')
-            S_smth[nzind,i] = np.matmul( phi, self.S[nzind,i].reshape(-1,1) )[:,0]
-        for i in range(self.nrec):
-            nzind = np.where(self.D[:,i] > 0)[0]
-            phi = kernel_function(self.M[nzind,:][:,nzind], eta, nu, kernel, normalization='unit_col_sum')
-            D_smth[nzind,i] = np.matmul( phi, self.D[nzind,i].reshape(-1,1) )[:,0]
-        self.S_smth = S_smth
-        self.D_smth = D_smth
-        self.kernel_eta = eta
-        self.kernel_nu = nu
-        self.kernel = kernel
-
-def assign_distance(adata, dmat=None):
-    if dmat is None:
-        adata.obsp["spatial_distance"] = distance_matrix(adata.obsm["spatial"], adata.obsm["spatial"])
-    else:
-        adata.obsp["spatial_distance"] = dmat
-
-def summarize_cluster(X, clusterid, clusternames, n_permutations=500):
-    # Input a sparse matrix of cell signaling and output a pandas dataframe
-    # for cluster-cluster signaling
-    n = len(clusternames)
-    X_cluster = np.empty([n,n], float)
-    p_cluster = np.zeros([n,n], float)
-    for i in range(n):
-        tmp_idx_i = np.where(clusterid==clusternames[i])[0]
-        for j in range(n):
-            tmp_idx_j = np.where(clusterid==clusternames[j])[0]
-            X_cluster[i,j] = X[tmp_idx_i,:][:,tmp_idx_j].mean()
-    for i in range(n_permutations):
-        clusterid_perm = np.random.permutation(clusterid)
-        X_cluster_perm = np.empty([n,n], float)
-        for j in range(n):
-            tmp_idx_j = np.where(clusterid_perm==clusternames[j])[0]
-            for k in range(n):
-                tmp_idx_k = np.where(clusterid_perm==clusternames[k])[0]
-                X_cluster_perm[j,k] = X[tmp_idx_j,:][:,tmp_idx_k].mean()
-        p_cluster[X_cluster_perm >= X_cluster] += 1.0
-    p_cluster = p_cluster / n_permutations
-    df_cluster = pd.DataFrame(data=X_cluster, index=clusternames, columns=clusternames)
-    df_p_value = pd.DataFrame(data=p_cluster, index=clusternames, columns=clusternames)
-    return df_cluster, df_p_value
-
-def cluster_center(adata, clustering, method="geometric_mean"):
-    X = adata.obsm['spatial']
-    cluster_pos = {}
-    clusternames = list( adata.obs[clustering].unique() )
-    clusternames.sort()
-    clusterid = np.array( adata.obs[clustering], str )
-    for name in clusternames:
-        tmp_idx = np.where(clusterid==name)[0]
-        tmp_X = X[tmp_idx]
-        if method == "geometric_mean":
-            X_mean = np.mean(tmp_X, axis=0)
-        elif method == "representative_point":
-            tmp_D = distance_matrix(tmp_X, tmp_X)
-            tmp_D = tmp_D ** 2
-            X_mean = tmp_X[np.argmin(tmp_D.sum(axis=1)),:]
-        cluster_pos[name] = X_mean
-    return cluster_pos
-
-def spatial_communication(
-    adata: anndata.AnnData, 
-    database_name: str = None, 
-    df_ligrec: pd.DataFrame = None,
-    pathway_sum: bool = False,
-    heteromeric: bool = False,
-    heteromeric_rule: str = 'min',
-    heteromeric_delimiter: str = '_', 
-    dis_thr: Optional[float] = None, 
-    cost_scale: Optional[dict] = None, 
-    cost_type: str = 'euc',
-    cot_eps_p: float = 1e-1, 
-    cot_eps_mu: Optional[float] = None, 
-    cot_eps_nu: Optional[float] = None, 
-    cot_rho: float =1e1, 
-    cot_nitermax: int = 10000, 
-    cot_weights: tuple = (0.25,0.25,0.25,0.25), 
-    smooth: bool = False, 
-    smth_eta: float = None, 
-    smth_nu: float = None, 
-    smth_kernel: str = 'exp',
-    copy: bool = False  
-):
-    """
-    Infer spatial communication.
-
-    Parameters
-    ----------
-    adata
-        The data matrix of shape ``n_obs`` × ``n_var``.
-        Rows correspond to cells or spots and columns to genes.
-        If the spatial distance is absent in ``.obsp['spatial_distance']``, Euclidean distance determined from ``.obsm['spatial']`` will be used.
-    database_name
-        Name of the ligand-receptor interaction database. Will be included in the keywords for anndata slots.
-    df_ligrec
-        A data frame where each row corresponds to a ligand-receptor pair with ligands, receptors, and the associated signaling pathways in the three columns, respectively.
-    pathway_sum
-        Whether to sum over all ligand-receptor pairs of each pathway.
-    heteromeric
-        Whether the ligands or receptors are made of heteromeric complexes.
-    heteromeric_rule
-        Use either 'min' (minimum) or 'ave' (average) expression of the components as the level for the heteromeric complex.
-    heteromeric_delimiter
-        The character in ligand and receptor names separating individual components.
-    dis_thr
-        The threshold of spatial distance of signaling.
-    cost_scale
-        Weight coefficients of the cost matrix for each ligand-receptor pair, e.g. cost_scale[('ligA','recA')] specifies weight for the pair ligA and recA.
-        If None, all pairs have the same weight. 
-    cost_type
-        If 'euc', the original Euclidean distance will be used as cost matrix. If 'euc_square', the square of the Euclidean distance will be used.
-    cot_eps_p
-        The coefficient of entropy regularization for transport plan.
-    cot_eps_mu
-        The coefficient of entropy regularization for untransported source (ligand). Set to equal to cot_eps_p for fast algorithm.
-    cot_eps_nu
-        The coefficient of entropy regularization for unfulfilled target (receptor). Set to equal to cot_eps_p for fast algorithm.
-    cot_rho
-        The coefficient of penalty for unmatched mass.
-    cot_nitermax
-        Maximum iteration for collective optimal transport algorithm.
-    cot_weights
-        A tuple of four weights that add up to one. The weights corresponds to four setups of collective optimal transport: 
-        1) all ligands-all receptors, 2) each ligand-all receptors, 3) all ligands-each receptor, 4) each ligand-each receptor.
-    smooth
-        Whether to (spatially) smooth the gene expression for identifying more global signaling trend.
-    smth_eta
-        Kernel bandwidth for smoothing
-    smth_nu
-        Kernel sharpness for smoothing
-    smth_kernel
-        'exp' exponential kernel. 'lorentz' Lorentz kernel.
-    copy
-        Whether to return a copy of the :class:`anndata.AnnData`.
-
-    Returns
-    -------
-    adata : anndata.AnnData
-        Signaling matrices are added to ``.obsp``, e.g., for a LR interaction database named "databaseX", 
-        ``.obsp['commot-databaseX-ligA-recA']``
-        is a ``n_obs`` × ``n_obs`` matrix with the *ij* th entry being the "score" of 
-        cell *i* sending signal to cell *j* through ligA and recA. If ``pathway_sum==True``, the cell-by-cell signaling matrix for a pathway "pathwayX" 
-        will be stored in ``.obsp['commot-databaseX-pathwayX']``.
-        The marginal sums (sender and receiver) of the signaling matrices are stored in ``.obsm['commot-databaseX-sum-sender']`` and ``.obsm['commot-databaseX-sum-receiver']``.
-        Metadata of the analysis is added to ``.uns['commot-databaseX-info']``.
-        If copy=True, return the AnnData object and return None otherwise.
-        
-    Examples
-    --------
-    >>> import anndata
-    >>> import commot as ct
-    >>> import pandas as pd
-    >>> import numpy as np
-    >>> # create a toy data with four cells and four genes
-    >>> X = np.array([[1,0,0,0],[2,0,0,0],[0,1,1,4],[0,3,4,1]], float)
-    >>> adata = anndata.AnnData(X=X, var=pd.DataFrame(index=['LigA','RecA','RecB','RecC']))
-    >>> adata.obsm['spatial'] = np.array([[0,0],[1,0],[0,1],[1,2]], float)
-    >>> # create a toy ligand-receptor database with two pairs sharing the same ligand
-    >>> df_ligrec = pd.DataFrame([['LigA','RecA_RecB'],['LigA','RecC']])
-    >>> df_ligrec = pd.DataFrame([['LigA','RecA_RecB','PathwayA'],['LigA','RecC','PathwayA']])
-    >>> # infer CCC with a distance threshold of 1.1. Due the threshold, the last cell won't be communicating with other cells.
-    >>> ct.tl.spatial_communication(adata, database_name='toyDB',df_ligrec=df_ligrec, pathway_sum=True, heteromeric=True, dis_thr=1.1)
-    >>> adata
-    AnnData object with n_obs × n_vars = 4 × 4
-        uns: 'commot-toyDB-info'
-        obsm: 'spatial', 'commot-toyDB-sum-sender', 'commot-toyDB-sum-receiver'
-        obsp: 'commot-toyDB-LigA-RecA_RecB', 'commot-toyDB-LigA-RecC', 'commot-toyDB-PathwayA', 'commot-toyDB-total-total'
-    >>> print(adata.obsp['commot-toyDB-LigA-RecA_RecB'])
-    (0, 2)	0.600000000000005
-    >>> print(adata.obsp['commot-toyDB-LigA-RecC'])
-    (0, 2)	0.9000000000039632
-    >>> print(adata.obsm['commot-toyDB-sum-receiver'])
-    r-LigA-RecA_RecB  r-LigA-RecC  r-total-total  r-PathwayA
-    0               0.0          0.0            0.0         0.0
-    1               0.0          0.0            0.0         0.0
-    2               0.6          0.9            1.5         1.5
-    3               0.0          0.0            0.0         0.0
-    >>> print(adata.obsm['commot-toyDB-sum-sender'])
-    s-LigA-RecA_RecB  s-LigA-RecC  s-total-total  s-PathwayA
-    0               0.6          0.9            1.5         1.5
-    1               0.0          0.0            0.0         0.0
-    2               0.0          0.0            0.0         0.0
-    3               0.0          0.0            0.0         0.0
-    >>> print(adata.obsp['commot-toyDB-PathwayA'])
-    (0, 2)	1.5000000000039682
-    >>> print(adata.obsp['commot-toyDB-total-total'])
-    (0, 2)	1.5000000000039682
-    >>> adata.uns['commot-toyDB-info']
-    {'df_ligrec':   ligand   receptor   pathway
-    0   LigA  RecA_RecB  PathwayA
-    1   LigA       RecC  PathwayA, 'distance_threshold': 1.1}
-    
-    
-    """
-
-    assert database_name is not None, "Please give a database_name"
-    assert df_ligrec is not None, "Please give a ligand-receptor database"
-
-    if not 'spatial_distance' in adata.obsp.keys():
-        dis_mat = distance_matrix(adata.obsm["spatial"], adata.obsm["spatial"])
-        # assign_distance(adata, dmat=None)
-    else:
-        dis_mat = adata.obsp['spatial_distance']
-
-    # remove unavailable genes from df_ligrec
-    if not heteromeric:
-        data_genes = list(adata.var_names)
-        tmp_ligrec = []
-        for i in range(df_ligrec.shape[0]):
-            if df_ligrec.iloc[i][0] in data_genes and df_ligrec.iloc[i][1] in data_genes:
-                tmp_ligrec.append([df_ligrec.iloc[i][0], df_ligrec.iloc[i][1], df_ligrec.iloc[i][2]])
-        tmp_ligrec = np.array(tmp_ligrec, str)
-        df_ligrec = pd.DataFrame(data=tmp_ligrec)
-    elif heteromeric:
-        data_genes = set(list(adata.var_names))
-        tmp_ligrec = []
-        for i in range(df_ligrec.shape[0]):
-            tmp_lig = df_ligrec.iloc[i][0].split(heteromeric_delimiter)
-            tmp_rec = df_ligrec.iloc[i][1].split(heteromeric_delimiter)
-            if set(tmp_lig).issubset(data_genes) and set(tmp_rec).issubset(data_genes):
-                tmp_ligrec.append([df_ligrec.iloc[i][0], df_ligrec.iloc[i][1], df_ligrec.iloc[i][2]])
-        tmp_ligrec = np.array(tmp_ligrec, str)
-        df_ligrec = pd.DataFrame(data=tmp_ligrec)
-    # Drop duplicate pairs
-    df_ligrec = df_ligrec.drop_duplicates()
-
-
-    model = CellCommunication(adata, 
-        df_ligrec, 
-        dis_mat, 
-        dis_thr, 
-        cost_scale, 
-        cost_type,
-        heteromeric = heteromeric,
-        heteromeric_rule = heteromeric_rule,
-        heteromeric_delimiter = heteromeric_delimiter
-    )
-    model.run_cot_signaling(cot_eps_p=cot_eps_p, 
-        cot_eps_mu = cot_eps_mu, 
-        cot_eps_nu = cot_eps_nu, 
-        cot_rho = cot_rho, 
-        cot_nitermax = cot_nitermax, 
-        cot_weights = cot_weights, 
-        smooth = smooth, 
-        smth_eta = smth_eta, 
-        smth_nu = smth_nu, 
-        smth_kernel = smth_kernel
-    )
-
-    
-    adata.uns['commot-'+database_name+'-info'] = {}
-    df_ligrec_write = pd.DataFrame(data=df_ligrec.values, columns=['ligand','receptor','pathway'])
-    adata.uns['commot-'+database_name+'-info']['df_ligrec'] = df_ligrec_write
-    adata.uns['commot-'+database_name+'-info']['distance_threshold'] = dis_thr
-
-    ncell = adata.shape[0]
-    X_sender = np.empty([ncell,0], float)
-    X_receiver = np.empty([ncell,0], float)
-    col_names_sender = []
-    col_names_receiver = []
-    tmp_ligs = model.ligs
-    tmp_recs = model.recs
-    S_total = sparse.csr_matrix((ncell, ncell), dtype=float)
-    if pathway_sum:
-        pathways = list(np.sort(list(set(df_ligrec.iloc[:,2].values))))
-        S_pathway = [sparse.csr_matrix((ncell, ncell), dtype=float) for i in range(len(pathways))]
-        X_sender_pathway = [np.zeros([ncell,1], float) for i in range(len(pathways))]
-        X_receiver_pathway = [np.zeros([ncell,1], float) for i in range(len(pathways))]
-    for (i,j) in model.comm_network.keys():
-        S = model.comm_network[(i,j)]
-        adata.obsp['commot-'+database_name+'-'+tmp_ligs[i]+'-'+tmp_recs[j]] = S
-        S_total = S_total + S
-        lig_sum = np.array(S.sum(axis=1))
-        rec_sum = np.array(S.sum(axis=0).T)
-        X_sender = np.concatenate((X_sender, lig_sum), axis=1)
-        X_receiver = np.concatenate((X_receiver, rec_sum), axis=1)
-        col_names_sender.append("s-%s-%s" % (tmp_ligs[i], tmp_recs[j]))
-        col_names_receiver.append("r-%s-%s" % (tmp_ligs[i], tmp_recs[j]))
-        if pathway_sum:
-            mask = (df_ligrec.iloc[:,0] == tmp_ligs[i]) & (df_ligrec.iloc[:,1] == tmp_recs[j])
-            pathway = df_ligrec[mask].iloc[:,2].values[0]
-            pathway_idx = pathways.index(pathway)
-            S_pathway[pathway_idx] = S_pathway[pathway_idx] + S
-            X_sender_pathway[pathway_idx] = X_sender_pathway[pathway_idx] + np.array(S.sum(axis=1))
-            X_receiver_pathway[pathway_idx] = X_receiver_pathway[pathway_idx] + np.array(S.sum(axis=0).T)
-    if pathway_sum:
-        for pathway_idx in range(len(pathways)):
-            pathway = pathways[pathway_idx]
-            adata.obsp['commot-'+database_name+'-'+pathway] = S_pathway[pathway_idx]
-
-    X_sender = np.concatenate((X_sender, X_sender.sum(axis=1).reshape(-1,1)), axis=1)
-    X_receiver = np.concatenate((X_receiver, X_receiver.sum(axis=1).reshape(-1,1)), axis=1)
-    col_names_sender.append("s-total-total")
-    col_names_receiver.append("r-total-total")
-    
-    if pathway_sum:
-        for pathway_idx in range(len(pathways)):
-            pathway = pathways[pathway_idx]
-            X_sender = np.concatenate((X_sender, X_sender_pathway[pathway_idx]), axis=1)
-            X_receiver = np.concatenate((X_receiver, X_receiver_pathway[pathway_idx]), axis=1)
-            col_names_sender.append("s-"+pathway)
-            col_names_receiver.append("r-"+pathway)
-
-    adata.obsp['commot-'+database_name+'-total-total'] = S_total
-
-    df_sender = pd.DataFrame(data=X_sender, columns=col_names_sender, index=adata.obs_names)
-    df_receiver = pd.DataFrame(data=X_receiver, columns=col_names_receiver, index=adata.obs_names)
-    adata.obsm['commot-'+database_name+'-sum-sender'] = df_sender
-    adata.obsm['commot-'+database_name+'-sum-receiver'] = df_receiver
-
-    del model
-    gc.collect()
-
-    return adata if copy else None
-
-
-def communication_direction(
+def communication_deg_detection(
     adata: anndata.AnnData,
+    n_var_genes: int = None,
+    var_genes = None,
     database_name: str = None,
     pathway_name: str = None,
-    lr_pair = None,
-    k: int = 5,
-    pos_idx: Optional[np.ndarray] = None,
-    copy: bool = False
+    summary: str = 'receiver',
+    lr_pair: tuple = ('total','total'),
+    nknots: int = 6,
+    n_deg_genes: int = None,
+    n_points: int = 50,
+    deg_pvalue_cutoff: float = 0.05,
 ):
     """
-    Construct spatial vector fields for inferred communication.
+    Identify signaling dependent genes
 
-    Parameters
-    ----------
-    adata
-        The data matrix of shape ``n_obs`` × ``n_var``.
-        Rows correspond to cells or spots and columns to genes.
-    database_name
-        Name of the ligand-receptor database.
-        If both pathway_name and lr_pair are None, the signaling direction of all ligand-receptor pairs is computed.
-    pathway_name
-        Name of the signaling pathway.
-        If given, only the signaling direction of this signaling pathway is computed.
-    lr_pair
-        A tuple of ligand-receptor pair. 
-        If given, only the signaling direction of this pair is computed.
-    k
-        Top k senders or receivers to consider when determining the direction.
-    pos_idx
-        The columns in ``.obsm['spatial']`` to use. If None, all columns are used.
-        For example, to use just the first and third columns, set pos_idx to ``numpy.array([0,2],int)``.
-    copy
-        Whether to return a copy of the :class:`anndata.AnnData`.
-    
-    Returns
-    -------
-    adata : anndata.AnnData
-        Vector fields describing signaling directions are added to ``.obsm``, 
-        e.g., for a database named "databaseX", 
-        ``.obsm['commot_sender_vf-databaseX-ligA-recA']`` and ``.obsm['commot_receiver_vf-databaseX-ligA-recA']``
-        describe the signaling directions of the cells as, respectively, senders and receivers through the 
-        ligand-receptor pair ligA and recA.
-        If copy=True, return the AnnData object and return None otherwise.
+    This function depends on tradeSeq [Van_den_Berge2020]_. Currently, tradeSeq version 1.0.1 with R version 3.6.3 has been tested to work.
+    For the R-python interface, rpy2==3.4.2 and anndata2ri==1.0.6 have been tested to work.
 
-    """
-
-    obsp_names = []
-    if not lr_pair is None:
-        obsp_names.append(database_name+'-'+lr_pair[0]+'-'+lr_pair[1])
-    elif not pathway_name is None:
-        obsp_names.append(database_name+'-'+pathway_name)
-    else:
-        obsp_names.append(database_name+'-total-total')
-
-    ncell = adata.shape[0]
-    pts = np.array( adata.obsm['spatial'], float )
-    if not pos_idx is None:
-        pts = pts[:,pos_idx]
-    storage = 'sparse'
-
-    if storage == 'dense':
-        for i in range(len(obsp_names)):
-            # lig = name_mat[i,0]
-            # rec = name_mat[i,1]
-            S_np = adata.obsp['commot-'+obsp_names[i]].toarray()
-            sender_vf = np.zeros_like(pts)
-            receiver_vf = np.zeros_like(pts)
-
-            tmp_idx = np.argsort(-S_np,axis=1)[:,:k]
-            avg_v = np.zeros_like(pts)
-            for ik in range(k):
-                tmp_v = pts[tmp_idx[:,ik]] - pts[np.arange(ncell,dtype=int)]
-                tmp_v = normalize(tmp_v, norm='l2')
-                avg_v = avg_v + tmp_v * S_np[np.arange(ncell,dtype=int),tmp_idx[:,ik]].reshape(-1,1)
-            avg_v = normalize(avg_v)
-            sender_vf = avg_v * np.sum(S_np,axis=1).reshape(-1,1)
-
-            S_np = S_np.T
-            tmp_idx = np.argsort(-S_np,axis=1)[:,:k]
-            avg_v = np.zeros_like(pts)
-            for ik in range(k):
-                tmp_v = -pts[tmp_idx[:,ik]] + pts[np.arange(ncell,dtype=int)]
-                tmp_v = normalize(tmp_v, norm='l2')
-                avg_v = avg_v + tmp_v * S_np[np.arange(ncell,dtype=int),tmp_idx[:,ik]].reshape(-1,1)
-            avg_v = normalize(avg_v)
-            receiver_vf = avg_v * np.sum(S_np,axis=1).reshape(-1,1)
-
-            del S_np
-
-    elif storage == 'sparse':
-        for i in range(len(obsp_names)):
-            # lig = name_mat[i,0]
-            # rec = name_mat[i,1]
-            S = adata.obsp['commot-'+obsp_names[i]]
-            S_sum_sender = np.array( S.sum(axis=1) ).reshape(-1)
-            S_sum_receiver = np.array( S.sum(axis=0) ).reshape(-1)
-            sender_vf = np.zeros_like(pts)
-            receiver_vf = np.zeros_like(pts)
-
-            S_lil = S.tolil()
-            for j in range(S.shape[0]):
-                if len(S_lil.rows[j]) <= k:
-                    tmp_idx = np.array( S_lil.rows[j], int )
-                    tmp_data = np.array( S_lil.data[j], float )
-                else:
-                    row_np = np.array( S_lil.rows[j], int )
-                    data_np = np.array( S_lil.data[j], float )
-                    sorted_idx = np.argsort( -data_np )[:k]
-                    tmp_idx = row_np[ sorted_idx ]
-                    tmp_data = data_np[ sorted_idx ]
-                if len(tmp_idx) == 0:
-                    continue
-                elif len(tmp_idx) == 1:
-                    avg_v = pts[tmp_idx[0],:] - pts[j,:]
-                else:
-                    tmp_v = pts[tmp_idx,:] - pts[j,:]
-                    tmp_v = normalize(tmp_v, norm='l2')
-                    avg_v = tmp_v * tmp_data.reshape(-1,1)
-                    avg_v = np.sum( avg_v, axis=0 )
-                avg_v = normalize( avg_v.reshape(1,-1) )
-                sender_vf[j,:] = avg_v[0,:] * S_sum_sender[j]
-            
-            S_lil = S.T.tolil()
-            for j in range(S.shape[0]):
-                if len(S_lil.rows[j]) <= k:
-                    tmp_idx = np.array( S_lil.rows[j], int )
-                    tmp_data = np.array( S_lil.data[j], float )
-                else:
-                    row_np = np.array( S_lil.rows[j], int )
-                    data_np = np.array( S_lil.data[j], float )
-                    sorted_idx = np.argsort( -data_np )[:k]
-                    tmp_idx = row_np[ sorted_idx ]
-                    tmp_data = data_np[ sorted_idx ]
-                if len(tmp_idx) == 0:
-                    continue
-                elif len(tmp_idx) == 1:
-                    avg_v = -pts[tmp_idx,:] + pts[j,:]
-                else:
-                    tmp_v = -pts[tmp_idx,:] + pts[j,:]
-                    tmp_v = normalize(tmp_v, norm='l2')
-                    avg_v = tmp_v * tmp_data.reshape(-1,1)
-                    avg_v = np.sum( avg_v, axis=0 )
-                avg_v = normalize( avg_v.reshape(1,-1) )
-                receiver_vf[j,:] = avg_v[0,:] * S_sum_receiver[j]
-
-
-
-            adata.obsm["commot_sender_vf-"+obsp_names[i]] = sender_vf
-            adata.obsm["commot_receiver_vf-"+obsp_names[i]] = receiver_vf
-
-    return adata if copy else None
-
-def cluster_communication(
-    adata: anndata.AnnData,
-    database_name: str = None,
-    pathway_name: str = None,
-    lr_pair = None,
-    clustering: str = None,
-    n_permutations: int = 100,
-    random_seed: int = 1,
-    copy: bool = False
-):
-    """
-    Summarize cell-cell communication to cluster-cluster communication and compute p-values by permutating cell/spot labels.
+    Here, the total received or sent signal for the spots are considered as a "gene expression" where tradeSeq is used to find the correlated genes.
 
     Parameters
     ----------
     adata
         The data matrix of shape ``n_obs`` × ``n_var``.
         Rows correspond to cells or positions and columns to genes.
-    database_name
-        Name of the ligand-receptor database.
-        If both pathway_name and lr_pair are None, the cluster signaling through all ligand-receptor pairs is summarized.
+        The count data should be available through adata.layers['count'].
+        For example, when examining the received signal through the ligand-receptor pair "ligA" and "RecA" infered with the LR database "databaseX", 
+        the signaling inference result should be available in 
+        ``adata.obsm['commot-databaseX-sum-receiver']['r-ligA-recA']``
+    n_var_genes
+        The number of most variable genes to test.
+    var_genes
+        The genes to test. n_var_genes will be ignored if given.
+    n_deg_genes
+        The number of top deg genes to evaluate yhat.
     pathway_name
-        Name of the signaling pathway.
-        If given, the signaling through all ligand-receptor pairs of the given pathway is summarized.
+        Name of the signaling pathway (choose from the third column of ``.uns['commot-databaseX-info']['df_ligrec']``).
+        If ``pathway_name`` is specified, ``lr_pair`` will be ignored.
+    summary
+        'sender' or 'receiver'
     lr_pair
-        A tuple of ligand-receptor pair. 
-        If given, only the cluster signaling through this pair is computed.
-    clustering
-        Name of clustering with the labels stored in ``.obs[clustering]``.
-    n_permutations
-        Number of label permutations for computing the p-value.
-    random_seed
-        The numpy random_seed for reproducible random permutations.
-    copy
-        Whether to return a copy of the :class:`anndata.AnnData`.
-    
+        A tuple of the ligand-receptor pair.
+        If ``pathway_name`` is specified, ``lr_pair`` will be ignored.
+    nknots
+        Number of knots in spline when constructing GAM.
+    n_points
+        Number of points on which to evaluate the fitted GAM 
+        for downstream clustering and visualization.
+    deg_pvalue_cutoff
+        The p-value cutoff of genes for obtaining the fitted gene expression patterns.
+
     Returns
     -------
-    adata : anndata.AnnData
-        Add cluster-cluster communication matrix to 
-        ``.uns['commot_cluster-databaseX-clustering-ligA-recA']``
-        for the ligand-receptor database named 'databaseX' and the cell clustering 
-        named 'clustering' through the ligand-receptor pair 'ligA' and 'recA'.
-        The first object is the communication score matrix and the second object contains
-        the corresponding p-values.
-        If copy=True, return the AnnData object and return None otherwise.
+    df_deg: pd.DataFrame
+        A data frame of deg analysis results, including Wald statistics, degree of freedom, and p-value.
+    df_yhat: pd.DataFrame
+        A data frame of smoothed gene expression values.
+    
+    References
+    ----------
+
+    .. [Van_den_Berge2020] Van den Berge, K., Roux de Bézieux, H., Street, K., Saelens, W., Cannoodt, R., Saeys, Y., ... & Clement, L. (2020). 
+        Trajectory-based differential expression analysis for single-cell sequencing data. Nature communications, 11(1), 1-13.
 
     """
-    np.random.seed(random_seed)
+    # setup R environment
+    # !!! anndata2ri works only with 3.6.3 on the tested machine
+    import rpy2
+    import anndata2ri
+    import rpy2.robjects as ro
+    from rpy2.robjects.conversion import localconverter
+    import rpy2.rinterface_lib.callbacks
+    import logging
+    rpy2.rinterface_lib.callbacks.logger.setLevel(logging.ERROR)
 
-    assert database_name is not None, "Please at least specify database_name."
+    ro.r('library(tradeSeq)')
+    ro.r('library(clusterExperiment)')
+    anndata2ri.activate()
+    ro.numpy2ri.activate()
+    ro.pandas2ri.activate()
 
-    celltypes = list( adata.obs[clustering].unique() )
-    celltypes.sort()
-    for i in range(len(celltypes)):
-        celltypes[i] = str(celltypes[i])
-    clusterid = np.array(adata.obs[clustering], str)
-    obsp_names = []
-    if not lr_pair is None:
-        obsp_names.append(database_name+'-'+lr_pair[0]+'-'+lr_pair[1])
-    elif not pathway_name is None:
-        obsp_names.append(database_name+'-'+pathway_name)
+    # prepare input adata for R
+    adata_deg = anndata.AnnData(
+        X = adata.layers['counts'],
+        var = pd.DataFrame(index=list(adata.var_names)),
+        obs = pd.DataFrame(index=list(adata.obs_names)))
+    adata_deg_var = adata_deg.copy()
+    sc.pp.filter_genes(adata_deg_var, min_cells=3)
+    sc.pp.filter_genes(adata_deg, min_cells=3)
+    sc.pp.normalize_total(adata_deg_var, target_sum=1e4)
+    sc.pp.log1p(adata_deg_var)
+    if n_var_genes is None:
+        sc.pp.highly_variable_genes(adata_deg_var, min_mean=0.0125, max_mean=3, min_disp=0.5)
+    elif not n_var_genes is None:
+        sc.pp.highly_variable_genes(adata_deg_var, n_top_genes=n_var_genes)
+    if var_genes is None:
+        adata_deg = adata_deg[:, adata_deg_var.var.highly_variable]
     else:
-        obsp_names.append(database_name+'-total-total')
-    # name_mat = adata.uns['commot-'+pathway_name+'-info']['df_ligrec'].values
-    # name_mat = np.concatenate((name_mat, np.array([['total','total']],str)), axis=0)
-    for i in range(len(obsp_names)):
-        S = adata.obsp['commot-'+obsp_names[i]]
-        tmp_df, tmp_p_value = summarize_cluster(S,
-            clusterid, celltypes, n_permutations=n_permutations)
-        adata.uns['commot_cluster-'+clustering+'-'+obsp_names[i]] = {'communication_matrix': tmp_df, 'communication_pvalue': tmp_p_value}
+        adata_deg = adata_deg[:, var_genes]
+    del adata_deg_var
+
+    summary_name = 'commot-'+database_name+'-sum-'+summary
+    if summary == 'sender':
+        summary_abrv = 's'
+    else:
+        summary_abrv = 'r'
+    if not pathway_name is None:
+        comm_sum = adata.obsm[summary_name][summary_abrv+'-'+pathway_name].values.reshape(-1,1)
+    elif pathway_name is None:
+        comm_sum = adata.obsm[summary_name][summary_abrv+'-'+lr_pair[0]+'-'+lr_pair[1]].values.reshape(-1,1)
+    cell_weight = np.ones_like(comm_sum).reshape(-1,1)
+
+    # send adata to R
+    adata_r = anndata2ri.py2rpy(adata_deg)
+    ro.r.assign("adata", adata_r)
+    ro.r("X <- as.matrix( assay( adata, 'X') )")
+    ro.r.assign("pseudoTime", comm_sum)
+    ro.r.assign("cellWeight", cell_weight)
+
+    # perform analysis (tradeSeq-1.0.1 in R-3.6.3)
+    string_fitGAM = 'sce <- fitGAM(counts=X, pseudotime=pseudoTime[,1], cellWeights=cellWeight[,1], nknots=%d, verbose=TRUE); NULL' % nknots
+    ro.r(string_fitGAM)
+    ro.r('assoRes <- data.frame( associationTest(sce, global=FALSE, lineage=TRUE) )')
+    ro.r('assoRes[is.nan(assoRes[,"waldStat_1"]),"waldStat_1"] <- 0.0')
+    ro.r('assoRes[is.nan(assoRes[,"df_1"]),"df_1"] <- 0.0')
+    ro.r('assoRes[is.nan(assoRes[,"pvalue_1"]),"pvalue_1"] <- 1.0')
+    with localconverter(ro.pandas2ri.converter):
+        df_assoRes = ro.r['assoRes']
+    ro.r('assoRes = assoRes[assoRes[,"pvalue_1"] <= %f,]' % deg_pvalue_cutoff)
+    ro.r('oAsso <- order(assoRes[,"waldStat_1"], decreasing=TRUE)')
+    if n_deg_genes is None:
+        n_deg_genes = df_assoRes.shape[0]
+    ro.r('genes_use <- rownames(assoRes)[oAsso]')
+    ro.r('genes_use <- genes_use[genes_use %in% rownames(sce)]')
+    ro.r('if (length(genes_use) > 0) { genes_use <- genes_use[seq_len(min(%d, length(genes_use)))] } else { genes_use <- character(0) }' % n_deg_genes)
+    n_genes_selected = int(ro.r('length(genes_use)')[0])
+    if n_genes_selected > 0:
+        string_cluster = 'clusPat <- clusterExpressionPatterns(sce, nPoints = %d, ' % n_points\
+            + 'verbose=TRUE, genes = genes_use, ' \
+            + 'k0s=4:5, alphas=c(0.1)); NULL'
+        ro.r(string_cluster)
+        ro.r('yhatScaled <- data.frame(clusPat$yhatScaled)')
+        with localconverter(ro.pandas2ri.converter):
+            yhat_scaled = ro.r['yhatScaled']
+    else:
+        yhat_scaled = pd.DataFrame()
+
+    df_deg = df_assoRes.rename(columns={'waldStat_1':'waldStat', 'df_1':'df', 'pvalue_1':'pvalue'})
+    idx = np.argsort(-df_deg['waldStat'].values)
+    df_deg = df_deg.iloc[idx]
+    df_yhat = yhat_scaled
+
+    anndata2ri.deactivate()
+    ro.numpy2ri.deactivate()
+    ro.pandas2ri.deactivate()
+
+    return df_deg, df_yhat
     
-    return adata if copy else None
+def communication_deg_clustering(
+    df_deg: pd.DataFrame,
+    df_yhat: pd.DataFrame,
+    deg_clustering_npc: int = 10,
+    deg_clustering_knn: int = 5,
+    deg_clustering_res: float = 1.0,
+    n_deg_genes: int = 200,
+    p_value_cutoff: float = 0.05
+):
+    """
+    Cluster the communcation DE genes based on their fitted expression pattern.
 
+    Parameters
+    ----------
+    df_deg
+        The deg analysis summary data frame obtained by running ``commot.tl.communication_deg_detection``.
+        Each row corresponds to one tested genes and columns include "waldStat" (Wald statistics), "df" (degrees of freedom), and "pvalue" (p-value of the Wald statistics).
+    df_yhat
+        The fitted (smoothed) gene expression pattern obtained by running ``commot.tl.communication_deg_detection``.
+    deg_clustering_npc
+        Number of PCs when performing PCA to cluster gene expression patterns
+    deg_clustering_knn
+        Number of neighbors when constructing the knn graph for leiden clustering.
+    deg_clustering_res
+        The resolution parameter for leiden clustering.
+    n_deg_genes
+        Number of top deg genes to cluster.
+    p_value_cutoff
+        The p-value cutoff for genes to be included in clustering analysis.
 
-def cluster_communication_spatial_permutation(
+    Returns
+    -------
+    df_deg_clus: pd.DataFrame
+        A data frame of clustered genes.
+    df_yhat_clus: pd.DataFrame
+        The fitted gene expression patterns of the clustered genes
+
+    """
+    df_deg = df_deg[df_deg['pvalue'] <= p_value_cutoff]
+    n_deg_genes = min(n_deg_genes, df_deg.shape[0])
+    idx = np.argsort(-df_deg['waldStat'])
+    df_deg = df_deg.iloc[idx[:n_deg_genes]]
+    yhat_scaled = df_yhat.loc[df_deg.index]
+    x_pca = PCA(n_components=deg_clustering_npc, svd_solver='full').fit_transform(yhat_scaled.values)
+    cluster_labels = leiden_clustering(x_pca, k=deg_clustering_knn, resolution=deg_clustering_res, input='embedding')
+
+    data_tmp = np.concatenate((df_deg.values, cluster_labels.reshape(-1,1)),axis=1)
+    df_metadata = pd.DataFrame(data=data_tmp, index=df_deg.index,
+        columns=['waldStat','df','pvalue','cluster'] )
+    return df_metadata, yhat_scaled
+
+def communication_impact(
     adata: anndata.AnnData,
-    df_ligrec: pd.DataFrame = None,
     database_name: str = None,
-    heteromeric: bool = False,
-    heteromeric_rule: str = 'min',
+    pathway_name: str = None,
+    pathway_sum_only: bool = False,
     heteromeric_delimiter: str = '_',
-    dis_thr: Optional[float] = None, 
-    cost_scale: Optional[dict] = None, 
-    cost_type: str = 'euc',
-    cot_eps_p: float = 1e-1, 
-    cot_eps_mu: Optional[float] = None, 
-    cot_eps_nu: Optional[float] = None, 
-    cot_rho: float =1e1, 
-    cot_nitermax: int = 100, 
-    cot_weights: tuple = (0.25,0.25,0.25,0.25), 
-    smooth: bool = False, 
-    smth_eta: float = None, 
-    smth_nu: float = None, 
-    smth_kernel: str = 'exp',
-    clustering: str = None,
-    perm_type: str = 'within_cluster',
-    n_permutations: int = 100,
-    random_seed: int = 1,
-    verbose: bool = True,
-    copy: bool = False
+    normalize: bool = False,
+    method: str = None,
+    corr_method: str = "spearman",
+    tree_method: str = "rf",
+    tree_ntrees: int = 100,
+    tree_repeat: int = 100,
+    tree_max_depth: int = 5,
+    tree_max_features: str = 'sqrt',
+    tree_learning_rate: float = 0.1,
+    tree_subsample: float = 1.0,
+    tree_combined: bool = False,
+    ds_genes: list = None,
+    bg_genes: Union[list, int] = 100
 ):
     """
-    Infer cluster-cluster communication and compute p-value by permutating cell/spot locations.
+    Analyze impact of communication.
 
-    The cluster_communication function using label permutations is computationally efficient but may overestimate the communications of neighboring cell clusters.
-    This function compute the p-value by permutating the locations of cell or spots and requires more computation time since the communication matrix is recomputed for each permutation.
-    To avoid repeated calculation of the cell-level CCC matrices, the cluster-level CCC is summarized for all LR pairs and signaling pathways.
-
-    Parameters
-    ----------
-    adata
-        The data matrix of shape ``n_obs`` × ``n_var``.
-        Rows correspond to cells or spots and columns to genes.
-        If the spatial distance is absent in ``.obsp['spatial_distance']``, Euclidean distance determined from ``.obsm['spatial']`` will be used.
-    df_ligrec
-        A data frame where each row corresponds to a ligand-receptor pair with ligands, receptors, and the associated signaling pathways in the three columns, respectively.
-    database_name
-        Name of the ligand-receptor interaction database. Will be included in the keywords for anndata slots.
-    heteromeric
-        Whether the ligands or receptors are made of heteromeric complexes.
-    heteromeric_rule
-        Use either 'min' (minimum) or 'ave' (average) expression of the components as the complex level.
-    heteromeric_delimiter
-        The character in ligand and receptor names separating individual components.
-    dis_thr
-        The threshold of spatial distance of signaling.
-    cost_scale
-        Weight coefficients of the cost matrix for each ligand-receptor pair, e.g. cost_scale[('ligA','recA')] specifies weight for the pair ligA and recA.
-        If None, all pairs have the same weight. 
-    cost_type
-        If 'euc', the original Euclidean distance will be used as cost matrix. If 'euc_square', the square of the Euclidean distance will be used.
-    cot_eps_p
-        The coefficient of entropy regularization for transport plan.
-    cot_eps_mu
-        The coefficient of entropy regularization for untransported source (ligand). Set to equal to cot_eps_p for fast algorithm.
-    cot_eps_nu
-        The coefficient of entropy regularization for unfulfilled target (receptor). Set to equal to cot_eps_p for fast algorithm.
-    cot_rho
-        The coefficient of penalty for unmatched mass.
-    cot_nitermax
-        Maximum iteration for collective optimal transport algorithm.
-        The default of this parameter is set to a much smaller one (100) compared to the default in ``spatial_communication`` to speed up the repeated OT calculation.
-        The resulting communication matrices will be slightly different from the using 10000 for cot_nitermax but very similar.
-    cot_weights
-        A tuple of four weights that add up to one. The weights corresponds to four setups of collective optimal transport: 
-        1) all ligands-all receptors, 2) each ligand-all receptors, 3) all ligands-each receptor, 4) each ligand-each receptor.
-    smooth
-        Whether to (spatially) smooth the gene expression for identifying more global signaling trend.
-    smth_eta
-        Kernel bandwidth for smoothing
-    smth_nu
-        Kernel sharpness for smoothing
-    smth_kernel
-        'exp' exponential kernel. 'lorentz' Lorentz kernel.
-    clustering
-        Name of clustering with the labels stored in ``.obs[clustering]``.
-    perm_type
-        The type of permutation to perform. 
-        If "within_cluster", the cells/spots are permutated within each cluster.
-        If "all_cell", the cells/spots are permutated all together.
-    n_permutations
-        Number of location permutations for computing the p-value.
-    random_seed
-        The numpy random_seed for reproducible random permutations.
-    verbose
-        Whether to print the permutation iterations.
-    copy
-        Whether to return a copy of the :class:`anndata.AnnData`.
-
-    Returns
-    -------
-    adata : anndata.AnnData
-        For example, the cluster-level communication summary by this location permutation method for the LR pair 'LigA' and 'RecA' from the database 'databaseX' is stored in 
-        ``adata.uns['commot_cluster_spatial_permutation-databaseX-clustering-ligA-recA']``
-        If copy=True, return the AnnData object and return None otherwise.
-
-    """
-
-    assert perm_type in ['all_cell','within_cluster'], "Please specify 'all_cell' or 'within_cluster' for perm_type."
-
-    # Assign a spatial distance matrix among spots
-    dis_mats = []
-    if not 'spatial_distance' in adata.obsp.keys():
-        dis_mat = distance_matrix(adata.obsm["spatial"], adata.obsm["spatial"])
-    else:
-        dis_mat = adata.obsp['spatial_distance']
-
-    # Remove unavailable genes from df_ligrec
-    print(df_ligrec.shape)
-    if not heteromeric:
-        data_genes = list(adata.var_names)
-        tmp_ligrec = []
-        for i in range(df_ligrec.shape[0]):
-            if df_ligrec.iloc[i][0] in data_genes and df_ligrec.iloc[i][1] in data_genes:
-                tmp_ligrec.append([df_ligrec.iloc[i][0], df_ligrec.iloc[i][1], df_ligrec.iloc[i][2]])
-        tmp_ligrec = np.array(tmp_ligrec, str)
-        df_ligrec = pd.DataFrame(data=tmp_ligrec, columns=['ligand','receptor','pathway'])
-    elif heteromeric:
-        data_genes = set(list(adata.var_names))
-        tmp_ligrec = []
-        for i in range(df_ligrec.shape[0]):
-            tmp_lig = df_ligrec.iloc[i][0].split(heteromeric_delimiter)
-            tmp_rec = df_ligrec.iloc[i][1].split(heteromeric_delimiter)
-            if set(tmp_lig).issubset(data_genes) and set(tmp_rec).issubset(data_genes):
-                tmp_ligrec.append([df_ligrec.iloc[i][0], df_ligrec.iloc[i][1], df_ligrec.iloc[i][2]])
-        tmp_ligrec = np.array(tmp_ligrec, str)
-        df_ligrec = pd.DataFrame(data=tmp_ligrec, columns=['ligand','receptor','pathway'])
-    # Drop duplicate pairs
-    df_ligrec = df_ligrec.drop_duplicates()
-    print(df_ligrec.shape)
-
-    # Generate permutation indices
-    perm_idx = []
-    ncell = adata.shape[0]
-    np.random.seed(random_seed)
-    perm_idx.append(np.arange(ncell))
-    for i in range(n_permutations):
-        if perm_type == 'all_cell':
-            perm_idx.append(np.random.permutation(ncell))
-        elif perm_type == 'within_cluster':
-            celltypes = np.sort( list( adata.obs[clustering].unique() ) )
-            clusterid = np.array(adata.obs[clustering], str)
-            tmp_perm_idx = np.arange(ncell)
-            for celltype in celltypes:
-                cell_idx = np.where(clusterid==celltype)[0]
-                tmp_perm_idx[cell_idx] = np.random.permutation(cell_idx)
-            perm_idx.append(tmp_perm_idx)
-                
-                
-    
-    # Compute the cluster-level commutation score for all permutations
-    # and all lr_pairs, and pathways
-    celltypes = list( adata.obs[clustering].unique() )
-    celltypes.sort()
-    clusterid = np.array(adata.obs[clustering], str)
-
-    pathways = list(set(df_ligrec['pathway']))
-    n_uns_names = len(df_ligrec) + len(pathways) + 1
-
-    S_cl = np.empty([len(perm_idx), len(celltypes), len(celltypes), n_uns_names], float)
-
-    uns_names = []
-
-
-    for i_perm in range(len(perm_idx)):
-        if verbose:
-            print("Permutation: ", i_perm)
-        adata_tmp = anndata.AnnData(adata[perm_idx[i_perm],:].X, 
-            obs=pd.DataFrame(index=adata[perm_idx[i_perm],:].obs_names),
-            var=pd.DataFrame(index=adata.var_names))
-        model = CellCommunication(adata_tmp,
-            df_ligrec, 
-            dis_mat, 
-            dis_thr, 
-            cost_scale, 
-            cost_type,
-            heteromeric = heteromeric,
-            heteromeric_rule = heteromeric_rule,
-            heteromeric_delimiter = heteromeric_delimiter
-        )
-        model.run_cot_signaling(cot_eps_p=cot_eps_p, 
-            cot_eps_mu = cot_eps_mu, 
-            cot_eps_nu = cot_eps_nu, 
-            cot_rho = cot_rho, 
-            cot_nitermax = cot_nitermax, 
-            cot_weights = cot_weights, 
-            smooth = smooth, 
-            smth_eta = smth_eta, 
-            smth_nu = smth_nu, 
-            smth_kernel = smth_kernel
-        )
-        for i_pair in range(len(df_ligrec)):
-            lig = df_ligrec.iloc[i_pair]['ligand']
-            rec = df_ligrec.iloc[i_pair]['receptor']
-            i = model.ligs.index(lig)
-            j = model.recs.index(rec)
-            S_tmp = model.comm_network[(i,j)]
-            uns_names.append(database_name+'-'+lig+'-'+rec)
-            df_cluster_tmp,_ = summarize_cluster(S_tmp, clusterid, celltypes, n_permutations=1)
-            S_cl[i_perm, :, :, i_pair] = df_cluster_tmp.values[:,:]
-        for i_pathway in range(len(pathways)):
-            pathway = pathways[i_pathway]
-            S_tmp = sparse.csr_matrix((ncell, ncell), dtype=float)
-            for i_pair in range(df_ligrec.shape[0]):
-                if df_ligrec.iloc[i_pair,2] == pathway:
-                    i = model.ligs.index(df_ligrec.iloc[i_pair]['ligand'])
-                    j = model.recs.index(df_ligrec.iloc[i_pair]['receptor'])
-                    S_tmp = S_tmp + model.comm_network[(i,j)]
-            uns_names.append(database_name+'-'+pathway)
-            df_cluster_tmp,_ = summarize_cluster(S_tmp, clusterid, celltypes, n_permutations=1)
-            S_cl[i_perm, :, :, len(df_ligrec)+i_pathway] = df_cluster_tmp.values[:,:]
-        S_tmp = sparse.csr_matrix((ncell, ncell), dtype=float)
-        for (i,j) in model.comm_network.keys():
-            S_tmp = S_tmp + model.comm_network[(i,j)]
-        uns_names.append(database_name+'-total-total')
-        df_cluster_tmp,_ = summarize_cluster(S_tmp, clusterid, celltypes, n_permutations=1)
-        S_cl[i_perm, :, :, -1] = df_cluster_tmp.values[:,:]
-        
-        del model
-        gc.collect()
-    
-    # Compute p-value
-    for i_uns in range(S_cl.shape[-1]):
-        p_cluster = np.zeros([len(celltypes), len(celltypes)], float)
-        for i_perm in range(n_permutations):
-            p_cluster[S_cl[i_perm+1,:,:, i_uns] >= S_cl[0,:,:, i_uns]] += 1.0
-        p_cluster = p_cluster / n_permutations
-        df_cluster = pd.DataFrame(data=S_cl[0,:,:,i_uns], index=celltypes, columns=celltypes)
-        df_p_value = pd.DataFrame(data=p_cluster, index=celltypes, columns=celltypes)
-        adata.uns['commot_cluster_spatial_permutation-'+clustering+'-'+uns_names[i_uns]] = {'communication_matrix': df_cluster, 'communication_pvalue': df_p_value}
-
-    return adata if copy else None
-
-def cluster_position(
-    adata: anndata.AnnData,
-    clustering: str = None,
-    method: str = 'geometric_mean',
-    copy: bool = False
-):
-    """
-    Assign spatial positions to clusters.
+    When using the 'treebased_score' as the method, there is potentially dilution of importance between the LR pairs if 'tree_combined' is set to True.
+    Therefore, if uniqueness of potential impact of various LR pairs on the target genes is not the focus, 'tree_combined' can be set to False.
+    If the unique impact of signaling in addition to the intra-cellular regulatory impact of target genes is not of interest, 'bg_genes' can be set to 0.
 
     Parameters
     ----------
     adata
         The data matrix of shape ``n_obs`` × ``n_var``.
         Rows correspond to cells or positions and columns to genes.
-    clustering
-        Name of clustering with the labels stored in ``.obs[clustering]``.
+        The full normalized dataset should be available in ``adata.raw``.
+    database_name
+        Name of the ligand-receptor database. 
+    pathway_name
+        Name of the signaling pathway.
+    pathway_sum_only
+        If ``True``, examine only the total signaling activity sum over signaling pathways without looking at individual ligand-receptor pairs.
+    heteromeric_delimiter
+        The delimiter that separates heteromeric units in the ligand-receptor database.
+    normalize
+        Whether to perform normalization before determining variable genes.
     method
-        'geometric_mean' geometric mean of the positions. 
-        'representative_point' the position in the cluster with 
-        minimum total distance to other points.
-    copy
-        Whether to return a copy of the :class:`anndata.AnnData`.
+        'partial_corr': partial correlation.
+        'semipartial_corr': semipartial correlation.
+        'treebased_score': machine learning based score (ensemble of trees).
+    corr_method
+        The correlation coefficient to use when method is 'partial_corr' or 'semipartial_corr'.
+        'spearman': Spearman's r. 'pearson': Pearson's r.
+    tree_method
+        The ensemble of trees method to use when method is 'treebased_score'.
+        'gbt': gradient boosted trees. 'rf': random forest.
+    tree_ntrees
+        Number of trees when using 'treebased_score'.
+    tree_repeat
+        Number of times to repeat to account for randomness when using 'treebased_score'.
+    tree_mas_depth
+        Max depth of trees when using 'treebased_score'.
+    tree_max_features
+        Max features for trees when using 'treebased_score'.
+    tree_learning_rate
+        Learning rate when using 'treebased_score'.
+    tree_subsample
+        Subsample (between 0 and 1) when using 'treebased_score'.
+    tree_combined
+        If True, use a single model for each target gene with all features.
+    ds_genes
+        A list of genes for analyzing the correlation with cell-cell communication, for example, the highly variable genes.
+    bg_genes
+        If an integer, the top number of variable genes are used.
+        Alternatively, a list of genes.
 
     Returns
     -------
-    adata : anndata.AnnData
-        Add cluster positions to ``.uns['cluster_pos-clustering_name']`` for the clustering named
-        'clustering_name'.
-        If copy=True, return the AnnData object and return None otherwise.
+    df_impact: pd.DataFrame
+        A data frame describing the correlation 
+        between the ds_genes and cell-cell communication.
+    """
+
+    # Get a list of background genes using most 
+    # variable genes if only given a number.
+    adata_bg = adata.raw.to_adata()
+    adata_all = adata.raw.to_adata()
+    if normalize:
+        sc.pp.normalize_total(adata_bg, inplace=True)
+        sc.pp.log1p(adata_bg)
+    if np.isscalar(bg_genes):
+        ng_bg = int(bg_genes)
+        sc.pp.highly_variable_genes(adata_bg, n_top_genes=ng_bg)
+        adata_bg = adata_bg[:,adata_bg.var.highly_variable]
+    else:
+        adata_bg = adata_bg[:,bg_genes]
+    # Prepare downstream or upstream genes
+    ncell = adata.shape[0]
+    col_names = []
+    Ds_exps = []
+    Ds_exp_total = np.zeros([ncell], float)
+    for i in range(len(ds_genes)):
+        Ds_exp = np.array(adata_all[:,ds_genes[i]].X.toarray()).reshape(-1)
+        Ds_exps.append(Ds_exp)
+        col_names.append(ds_genes[i])
+        Ds_exp_total += Ds_exp
+    Ds_exps.append(Ds_exp_total); col_names.append('average')
+    # Impact analysis
+    df_ligrec = adata.uns['commot-'+database_name+'-info']['df_ligrec']
+    available_pathways = []
+    for i in range(df_ligrec.shape[0]):
+        _, _, tmp_pathway = df_ligrec.iloc[i,:]
+        if not tmp_pathway in available_pathways:
+            available_pathways.append(tmp_pathway)
+    pathway_genes = [[] for i in range(len(available_pathways))]
+    all_lr_genes = []
+    for i in range(df_ligrec.shape[0]):
+        tmp_lig, tmp_rec, tmp_pathway = df_ligrec.iloc[i,:]
+        idx = available_pathways.index(tmp_pathway)
+        tmp_ligs = tmp_lig.split(heteromeric_delimiter)
+        tmp_recs = tmp_rec.split(heteromeric_delimiter)
+        for lig in tmp_ligs:
+            if not lig in pathway_genes[idx]:
+                pathway_genes[idx].append(lig)
+            if not lig in all_lr_genes:
+                all_lr_genes.append(lig)
+        for rec in tmp_recs:
+            if not rec in pathway_genes[idx]:
+                pathway_genes[idx].append(rec)
+            if not rec in all_lr_genes:
+                all_lr_genes.append(rec)
+    bg_genes = list( adata_bg.var_names )
+
+    sum_names = []
+    exclude_lr_genes_list = []
+    if pathway_name is None and not pathway_sum_only:
+        for i in range(df_ligrec.shape[0]):
+            tmp_lig, tmp_rec, _ = df_ligrec.iloc[i,:]
+            sum_names.append("%s-%s" % (tmp_lig, tmp_rec))
+            exclude_lr_genes_list.append(set(tmp_lig.split(heteromeric_delimiter)).union(set(tmp_rec.split(heteromeric_delimiter))))
+        for tmp_pathway in available_pathways:
+            sum_names.append(tmp_pathway)
+            exclude_lr_genes_list.append(set(pathway_genes[available_pathways.index(tmp_pathway)]))
+        sum_names.append('total-total')
+        exclude_lr_genes_list.append(set(all_lr_genes))
+    elif not pathway_name is None and not pathway_sum_only:
+        for i in range(df_ligrec.shape[0]):
+            tmp_lig, tmp_rec, tmp_pathway = df_ligrec.iloc[i,:]
+            if tmp_pathway == pathway_name:
+                sum_names.append("%s-%s" % (tmp_lig, tmp_rec))
+                exclude_lr_genes_list.append(set(tmp_lig.split(heteromeric_delimiter)).union(set(tmp_rec.split(heteromeric_delimiter))))
+        sum_names.append(pathway_name)
+        exclude_lr_genes_list.append(set(pathway_genes[available_pathways.index(pathway_name)]))
+
+    elif pathway_sum_only:
+        sum_names = available_pathways
+        for i in range(len(available_pathways)):
+            exclude_lr_genes_list.append(set(pathway_genes[i]))
+
+    nrows = 2 * len(sum_names)
+
+    ncols = len(ds_genes) + 1
+    impact_mat = np.empty([nrows, ncols], float)
+    
+    row_names_sender = []; row_names_receiver = []
+    exclude_lr_genes_list = []
+    for i in range(len(sum_names)):
+        row_names_sender.append('s-%s' % sum_names[i])
+        row_names_receiver.append('r-%s' % sum_names[i])
+    row_names = row_names_sender + row_names_receiver
+    exclude_lr_genes_list = exclude_lr_genes_list + exclude_lr_genes_list
+
+    print(nrows, ncols)
+    for j in range(ncols):
+        print(j)
+        if j == ncols-1:
+            exclude_ds_genes = set(ds_genes)
+        else:
+            exclude_ds_genes = set([ds_genes[j]])
+        if method == 'treebased_score' and tree_combined:
+            exclude_lr_genes = set(all_lr_genes)
+            exclude_genes = list(exclude_lr_genes.union(exclude_ds_genes))
+            use_genes = list( set(bg_genes) - set(exclude_genes) )
+            bg_mat = np.array( adata_bg[:,use_genes].X.toarray() )
+            sum_mat = np.concatenate((adata.obsm['commot-'+database_name+'-sum-sender'][row_names_sender].values, \
+                adata.obsm['commot-'+database_name+'-sum-receiver'][row_names_receiver].values), axis=1)
+            r = treebased_score_multifeature(sum_mat, Ds_exps[j], bg_mat,
+                n_trees = tree_ntrees, n_repeat = tree_repeat,
+                max_depth = tree_max_depth, max_features = tree_max_features,
+                learning_rate = tree_learning_rate, subsample = tree_subsample)
+            impact_mat[:,j] = r[:]
+        else:
+            for i in range(nrows):
+                row_name = row_names[i]
+                exclude_lr_genes = exclude_lr_genes_list[i]
+
+                exclude_genes = list(exclude_lr_genes.union(exclude_ds_genes))
+                use_genes = list( set(bg_genes) - set(exclude_genes) )
+                bg_mat = np.array( adata_bg[:,use_genes].X.toarray() )
+                if row_name[0] == 's':
+                    sum_vec = adata.obsm['commot-'+database_name+'-sum-sender'][row_name].values.reshape(-1,1)
+                elif row_name[0] == 'r':
+                    sum_vec = adata.obsm['commot-'+database_name+'-sum-receiver'][row_name].values.reshape(-1,1)
+                if method == "partial_corr":
+                    r,p = partial_corr(sum_vec, Ds_exps[j].reshape(-1,1), bg_mat, method=corr_method)
+                elif method == "semipartial_corr":
+                    r,p = semipartial_corr(sum_vec, Ds_exps[j].reshape(-1,1), ycov=bg_mat, method=corr_method)
+                elif method == "treebased_score":
+                    r = treebased_score(sum_vec, Ds_exps[j], bg_mat,
+                        n_trees = tree_ntrees, n_repeat = tree_repeat,
+                        max_depth = tree_max_depth, max_features = tree_max_features,
+                        learning_rate = tree_learning_rate, subsample = tree_subsample)
+                impact_mat[i,j] = r
+    df_impact = pd.DataFrame(data=impact_mat, index = row_names, columns = col_names)
+    return df_impact
+
+
+# Has not adapted new naming scheme
+def group_cluster_communication(
+    adata: anndata.AnnData,
+    clustering: str = None,
+    cluster_permutation_type: str = 'label',
+    keys = None,
+    p_value_cutoff: float = 0.05,
+    quantile_cutoff: float = 0.99,
+    dissimilarity_method: str = None,
+    leiden_k: int = 5,
+    leiden_resolution: float = 1.0,
+    leiden_random_seed: int = 1,
+    leiden_n_iterations: int = -1,
+    d_global_structure_weights: tuple = (0.45,0.45,0.1)
+):
+    """
+    Idenfitify groups of cluster-cluster communication with similar
+    pattern.
+
+    The CCC inference should have been summarized to cluster level using either :func:`commot.tl.cluster_communication` function 
+    or :func:`commot.tl.cluster_communication_spatial_permutation` function. The dissimilarities among different ligand-receptor pairs or signaling pathways
+    are first quantified which will be used with the leiden clustering algorithm [Traag2019]_ to cluster these CCC networks.
+
+    Parameters
+    ----------
+    adata
+        The data matrix with the cluster-cluster communication 
+        info stored in ``adata.uns``.
+    clustering
+        Name of clustering with the labels stored in ``.obs[clustering]``.
+    cluster_permutation_type
+        ``'label'`` if the function :func:`commot.tl.cluster_communication` was used and ``'spatial'`` if :func:`commot.tl.cluster_communication_spatial_permutation` was used.
+    keys
+        A list of keys for the analyzed communication connections as strings.
+        For example, the string ``'databaseX-pathwayX'`` represents the cluster-level CCC of signaling pathway "pathwayX" computed with the LR database "databaseX".
+        For another example, the string ``'databaseX-ligA-recA'`` represents the cluster-level CCC of the LR pair "ligA-recA" computed with the LR database "databaseX". 
+    p_value_cutoff
+        The cutoff of p-value for including an edge.
+    quantile_cutoff
+        The quantile cutoff for including an edge. Set to 1 to disable this criterion.
+        The quantile_cutoff and p_value_cutoff works in the "or" logic to avoid missing
+        significant signaling connections. 
+        An edge will be ignored only if it has a p-value greater than the ``p_value_cutoff`` and a score smaller than the score quantile cutoff.
+    dissimilarity_method
+        The dissimilarity measurement between graphs to use. 
+        'jaccard' for Jaccard distance.
+        'jaccard_weighted' for weighted Jaccard distance.
+        'global_structure' for a metric focusing on global structure [Schieber2017]_.
+    leiden_k
+        Number of neighbors for the knn-graph for using leiden clustering algorithm.
+    leiden_resolution
+        The resolution parameter for the leiden clustering algorithm.
+    leiden_random_seed
+        The random seed for the leiden clustering algorithm.
+    leiden_n_iterations
+        The maximum number of iterations for the leiden algorithm.
+        The algorithm will run until convergence if set to -1.
+    d_global_structure_weights
+        The weights for the three terms in the global structural dissimilarity.
+        See [Schieber2017]_ for more information.
+    
+    Returns
+    -------
+    communication_clusterid : np.ndarray
+        The group id of the cluster-cluster communications.
+    D : np.ndarray
+        The dissimilarity matrix for the cluster-cluster communications.
+
+    References
+    ----------
+    .. [Schieber2017] Schieber, T. A., Carpi, L., Díaz-Guilera, A., Pardalos, 
+        P. M., Masoller, C., & Ravetti, M. G. (2017). Quantification 
+        of network structural dissimilarities. Nature communications, 8(1), 1-10.
+    .. [Traag2019] Traag, V. A., Waltman, L., & Van Eck, N. J. (2019). 
+        From Louvain to Leiden: guaranteeing well-connected communities. Scientific reports, 9(1), 1-12.
 
     """
-    cluster_pos = cluster_center(adata, clustering, method=method)
-    adata.uns['cluster_pos-'+clustering] = cluster_pos
+    
+    # Get a list of filtered communication matrices corresponding to the keys.
+    As = []
+    for key in keys:
+        if cluster_permutation_type == 'label':
+            tmp_name = 'commot_cluster-%s-%s' % (clustering,key)
+        elif cluster_permutation_type == 'spatial':
+            tmp_name = 'commot_cluster_spatial_permutation-%s-%s' % (clustering,key)
+        X_tmp = adata.uns[tmp_name]['communication_matrix'].values.copy()
+        pvalue_tmp = adata.uns[tmp_name]['communication_pvalue'].values.copy()
+        if not quantile_cutoff is None:
+            cutoff = np.quantile(X_tmp.reshape(-1), quantile_cutoff)
+        else:
+            cutoff = np.inf
+        tmp_mask = ( X_tmp < cutoff ) * ( pvalue_tmp > p_value_cutoff )
+        X_tmp[tmp_mask] = 0
+        As.append(X_tmp)
+    # Get a distance/dissimilarity matrix between the communication matrices.
+    D = np.zeros([len(keys), len(keys)], float)
+    for i in range(len(keys)-1):
+        for j in range(i+1,len(keys)):
+            if dissimilarity_method == 'jaccard':
+                d = d_graph_local_jaccard(As[i], As[j])
+            elif dissimilarity_method == 'jaccard_weighted':
+                d = d_graph_local_jaccard_weighted(As[i], As[j])
+            elif dissimilarity_method == 'global_structure':
+                w1,w2,w3 = d_global_structure_weights
+                d = d_graph_global_structure(As[i], As[j], w1=w1, w2=w2, w3=w3)
+            D[i,j] = d; D[j,i] = d
+    # Perform clustering
+    leiden_k = min(leiden_k, len(keys)-1)
+    communication_clusterid = leiden_clustering(D,
+        k = leiden_k, resolution = leiden_resolution,
+        random_seed = leiden_random_seed, 
+        n_iterations = leiden_n_iterations)
+    
+    return communication_clusterid, D
 
-    return adata if copy else None
+def group_cell_communication(
+    adata: anndata.AnnData,
+    keys = None,
+    bin_method: str = 'gaussian_mixture',
+    bin_append_zeros: str = 'full',
+    bin_random_state: int = 1,
+    bin_cutoff: float = 0,
+    knn: int = 2,
+    dissimilarity_method: str = 'graphwave',
+    kw_graphwave: dict = {'sample_number':200, 'step_size':0.1, 'heat_coefficient': 1.0, 'approximation':100, 'mechanism':'approximation', 'switch':1000, 'seed':42},
+    leiden_k: int = 5,
+    leiden_resolution: float = 1.0,
+    leiden_random_seed: int = 1,
+    leiden_n_iterations: int = -1
+):
+    """
+    Idenfitify groups of cell-cell communication with similar
+    pattern.
+
+    The cell-cell communication should have been computed by the function :func:`commot.tl.spatial_communication`.
+
+    Parameters
+    ----------
+    adata
+        The data matrix with the cell-cell communication 
+        info stored in ``adata.obsp``.
+    keys
+        A list of keys for the analyzed communication connections as strings.
+        For example, the string ``'databaseX-pathwayX'`` represents the CCC of signaling pathway "pathwayX" computed with the LR database "databaseX".
+        For another example, the string ``'databaseX-ligA-recA'`` represents the CCC of the LR pair "ligA-recA" computed with the LR database "databaseX".
+        The cell-level CCC networks corresponding to the above examples are stored in ``.obsp['commot-databaseX-pathwayX]`` and ``.obsp['commot-databaseX-ligA-recA']``.
+    bin_method
+        Method for binarize communication connections. Choices: 'gaussian_mixture', 'kmeans'.
+    bin_append_zeros
+        Number of zeros to append to the non-zero entries when running the binarization.
+        'full' use the full flattened cell-by-cell communication matrix.
+        'match' append the same number of zeros to the vector of non-zero entries.
+    bin_random_state
+        The random seed for binarization methods.
+    bin_cutoff
+        Force all connections with a weight smaller than or equal to bin_cutoff to be zero
+        , regardless of binarization result.
+    knn
+        Number of neighbors for building the spatial knn graph.
+    dissimilarity_method
+        The method for quantifying dissimilarity.
+        'graphwave', node structural embedding by GraphWave [Donnat2018]_ implemented 
+        in `Karate Club
+        <https://github.com/benedekrozemberczki/karateclub/>`_.
+    kw_graphwave
+        Keywords for GraphWave. Defaults: {'sample_number':200, 'step_size':0.1, 'heat_coefficient': 1.0,
+        'approximation':100, 'mechanism':'approximation', 'switch':1000, 'seed':42} See details at `Karate Club
+        <https://github.com/benedekrozemberczki/karateclub/>`_.
+    leiden_k
+        Number of neighbors for the knn-graph to be fed to leiden clustering algorithm.
+    leiden_resolution
+        The resolution parameter for the leiden clustering algorithm.
+    leiden_random_seed
+        The random seed for the leiden clustering algorithm.
+    leiden_n_iterations
+        The maximum number of iterations for the leiden algorithm.
+        The algorithm will run until convergence if set to -1.
+    
+    Returns
+    -------
+    communication_clusterid : np.ndarray
+        The group id of the cell-cell communications.
+    D : np.ndarray
+        The dissimilarity matrix for the cell-cell communications.
+    
+
+    References
+    ----------
+    .. [Donnat2018] Donnat, C., Zitnik, M., Hallac, D., & Leskovec, J. (2018, July). Learning structural node embeddings 
+        via diffusion wavelets. In Proceedings of the 24th ACM SIGKDD International 
+        Conference on Knowledge Discovery & Data Mining (pp. 1320-1329).
+
+    """
+    
+    nkey = len(keys)
+    ncell = adata.shape[0]
+
+    # Get a dissimilarity matrix D
+    if dissimilarity_method == 'graphwave':
+        if knn > 0:
+            A_knn = kneighbors_graph(adata.obsm['spatial'],
+                knn, mode = 'connectivity', include_self = False)
+            A_spatial = A_knn + A_knn.T
+            A_spatial.eliminate_zeros()
+            A_spatial.data[:] = 1
+        elif knn == 0:
+            A_spatial = sparse.csr_matrix((ncell,ncell))
+        heat_mats = []
+        for key in keys:
+            A_signal = adata.obsp['commot-%s' % key]
+            A_signal_bin = binarize_sparse_matrix(A_signal, method = bin_method,
+                append_zeros = bin_append_zeros, random_state = bin_random_state)
+            A_signal_bin_sym = A_signal_bin + A_signal_bin.T
+            A_signal_bin_sym.eliminate_zeros()
+            A_signal_bin_sym.data[:] = 1
+            A = A_spatial + A_signal_bin_sym
+            gw = karateclub.GraphWave(**kw_graphwave)
+            G = nx.from_scipy_sparse_matrix(A)
+            gw.fit(G)
+            R = gw.get_embedding()
+            heat_mats.append(R)
+        D = np.zeros([nkey,nkey],float)
+        for i in range(nkey-1):
+            for j in range(i+1, nkey):
+                d = np.sqrt( np.linalg.norm(heat_mats[i] - heat_mats[j]) ** 2 / float(ncell) )
+                D[i,j] = d; D[j,i] = d
+
+    # Perform clustering on D
+    leiden_k = min(leiden_k, len(keys)-1)
+    communication_clusterid = leiden_clustering(D,
+        k = leiden_k, resolution = leiden_resolution,
+        random_seed = leiden_random_seed, 
+        n_iterations = leiden_n_iterations)
+
+    return communication_clusterid, D
+
+
+def group_communication_direction(
+    adata: anndata.AnnData,
+    keys: list = None,
+    summary: str = 'sender',
+    knn_smoothing: int = -1,
+    normalize_vf: str = 'quantile',
+    normalize_quantile: float = 0.99,
+    dissimilarity_method: str = 'dot_product',
+    leiden_k: int = 5,
+    leiden_resolution: float = 1.0,
+    leiden_random_seed: int = 1,
+    leiden_n_iterations: int = -1
+):
+    """
+    Idenfitify groups of communication directions with similar
+    pattern.
+
+    The cell-cell communication should have been computed by the function :func:`commot.tl.spatial_communication`.
+    The cell-cell communication direction should have been computed by the function :func:`commot.tl.communication_direction`.
+
+    Parameters
+    ----------
+    adata
+        The data matrix with the communication direction
+        info stored in ``adata.obsm``, e.g., ``.obsm['commot_sender_vf-databaseX-ligA-recA']`` stores the CCC direction of the LR pair 'ligA-recA' computed
+        with the LR database 'databaseX' summarized in the signal senders' perspective 
+    keys
+        A list of keys for the analyzed communication connections as strings.
+        For example, the string ``'databaseX-pathwayX'`` represents the CCC of signaling pathway "pathwayX" computed with the LR database "databaseX".
+        For another example, the string ``'databaseX-ligA-recA'`` represents the CCC of the LR pair "ligA-recA" computed with the LR database "databaseX".
+        The computed CCC direction corresponding to the above examples (summarized as 'sent to' or 'received from' directions) should be available in 
+        ``.obsm['commot_sender_vf-databaseX-pathwayX]``,  ``.obsm['commot_receiver_vf-databaseX-pathwayX]``and
+        ``.obsm['commot_sender_vf-databaseX-ligA-recA']``, ``.obsm['commot_receiver_vf-databaseX-ligA-recA']``.
+    summary
+        If 'sender', use the vector field describing to which direction the signals are sent to.
+        If 'receiver', use the vector field describing from which direction the signals are received from.
+    knn_smoothing
+        The number of neighbors to smooth the communication direction. 
+        If -1, no smoothing is performed.
+    normalize_vf
+        If 'quantile', divide all values by the length 
+        given by the normalize_quantile parameter.
+        If 'unit_norm', normalize each individual vector into unit norm.
+        If None, original unit is used.
+    normalize_quantile
+        The quantile parameter to use if normalize_vf is set to 'quantile'.
+    dissimilarity_method
+        Currently, only dot_product is implemented.
+    leiden_k
+        Number of neighbors for the knn-graph to be fed to leiden clustering algorithm.
+    leiden_resolution
+        The resolution parameter for the leiden clustering algorithm.
+    leiden_random_seed
+        The random seed for the leiden clustering algorithm.
+    leiden_n_iterations
+        The maximum number of iterations for the leiden algorithm.
+        The algorithm will run until convergence if set to -1.
+
+    Returns
+    -------
+    direction_clusterid : np.ndarray
+        The group id of the communication directions.
+    D : np.ndarray
+        The dissimilarity matrix for the communication directions.
+    
+    """
+    
+    # Process the vector fields
+    V_list = []
+    for key in keys:
+        V = adata.obsm['commot_%s_vf-%s' % (summary, key)]
+        V_processed = preprocess_vector_field(adata.obsm['spatial'],
+            V, knn_smoothing = knn_smoothing, normalize_vf = normalize_vf,
+            quantile = normalize_quantile)
+        V_list.append(V_processed)
+    # Get a distance matrix between the vector fields
+    nV = len(keys)
+    D = np.zeros([nV,nV], float)
+    for i in range(nV-1):
+        Vi = V_list[i]
+        for j in range(i+1,nV):
+            Vj = V_list[j]
+            if dissimilarity_method == 'dot_product':
+                d = np.exp( - ( ( Vi * Vj ).sum(axis=1) ).mean() )
+            D[i,j] = d; D[j,i] = d
+    # Cluster the vector fields with the D matrix
+    # Perform clustering
+    leiden_k = min(leiden_k, len(keys)-1)
+    direction_clusterid = leiden_clustering(D,
+        k = leiden_k, resolution = leiden_resolution,
+        random_seed = leiden_random_seed, 
+        n_iterations = leiden_n_iterations)
+    
+    return direction_clusterid, D
+
+
+def communication_spatial_autocorrelation(
+    adata: anndata.AnnData,
+    keys: list = None,
+    method: str = 'Moran',
+    normalize_vf: bool = False,
+    summary: str = 'sender',
+    weight_bandwidth: float = None,
+    weight_k: int = 10,
+    weight_function: str = 'triangular',
+    weight_row_standardize: bool = False,
+    n_permutations: int = 999
+):
+    """
+    Spatial autocorrelation of communication directions.
+
+    The spatial autocorrelation helps to detect spatial regions within which the CCC directions are similar.
+    The cell-cell communication should have been computed by the function :func:`commot.tl.spatial_communication`.
+    The cell-cell communication direction should have been computed by the function :func:`commot.tl.communication_direction`.
+
+    Parameters
+    ----------
+    adata
+        The data matrix with the communication vector fields
+        info stored in ``adata.ubsm``.
+    keys
+        A list of keys for the analyzed communication connections as strings.
+        For example, the string ``'databaseX-pathwayX'`` represents the CCC of signaling pathway "pathwayX" computed with the LR database "databaseX".
+        For another example, the string ``'databaseX-ligA-recA'`` represents the CCC of the LR pair "ligA-recA" computed with the LR database "databaseX".
+        The computed CCC direction corresponding to the above examples (summarized as 'sent to' or 'received from' directions) should be available in 
+        ``.obsm['commot_sender_vf-databaseX-pathwayX]``,  ``.obsm['commot_receiver_vf-databaseX-pathwayX]``and
+        ``.obsm['commot_sender_vf-databaseX-ligA-recA']``, ``.obsm['commot_receiver_vf-databaseX-ligA-recA']``.
+    method
+        The method to use. Currently, only Moran's I [Liu2015]_ for vectors is implemented.
+    normalize_vf
+        Whether to normalize the vector field so that the autocorrelation only reflects
+        directions.
+    summary
+        If 'sender', use the vector field describing to which direction the signals are sent.
+        If 'receiver', use the vector field describing from which direction the signals are from.
+    weight_bandwidth
+        The bandwidth for the kernel to assign knn graph weights.
+        If given, weight_k is ignored.
+    weight_k
+        The number of nearest neighbors for the knn graph.
+    weight_function
+        Kernel functions for assigning weight. 
+        Choices: 'triangular','uniform','quadratic','quartic','gaussian'.
+        See libpysal.weights.Kernel of the ``libpysal`` package for details.
+    weight_row_standardize
+        Whether to standardize the weights so that the heterogeneity in local cell/position
+        density does not affect the results.
+    n_permutations
+        Number of permutations for computing p-values.
+
+    Returns
+    -------
+    moranI : np.ndarray
+        A vector of moran's I statistics for corresponding to each key in keys.
+    p_value : np.ndarray
+        The p-values.
+
+    References
+    ----------
+    .. [Liu2015] Liu, Y., Tong, D., & Liu, X. (2015). Measuring spatial 
+        autocorrelation of vectors. Geographical Analysis, 47(3), 300-319.
+
+    """
+    
+    moranI = []
+    p_value = []
+    X = adata.obsm['spatial']
+    for key in keys:
+        V = adata.obsm['commot_%s_vf-%s' % (summary, key)]
+        if normalize_vf:
+            V = normalize(V)
+        I,p = moranI_vector_global(X, V,
+            weight_bandwidth = weight_bandwidth,
+            weight_k = weight_k,
+            weight_function = weight_function,
+            weight_row_standardize = weight_row_standardize,
+            n_permutations = n_permutations)
+        moranI.append(I)
+        p_value.append(p)
+    moranI = np.array(moranI, float)
+    p_value = np.array(p_value, float)
+
+    return moranI, p_value
